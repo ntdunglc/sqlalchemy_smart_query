@@ -1,11 +1,33 @@
 import logging
-from sqlalchemy import inspect, or_, and_, not_, exists
+from sqlalchemy import inspect, or_, and_, not_, exists, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql import operators
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def simple_op(op, column, value):
+    if op == "=":
+        condition = column == value
+    elif op == "like":
+        condition = column.like(value)
+    elif op == "in":
+        condition = column.in_(value)
+    elif op == ">":
+        condition = column > value
+    elif op == "<":
+        condition = column < value
+    elif op == ">=":
+        condition = column >= value
+    elif op == "<=":
+        condition = column <= value
+    elif op == "!=":
+        condition = column != value
+    else:
+        raise ValueError(f"Unsupported operator: {op}")
+    return condition
 
 
 def smart_query(session, model, query_params):
@@ -24,49 +46,41 @@ def smart_query(session, model, query_params):
             if "." in field:
                 parts = field.split(".")
                 current_model = model
-                subquery = session.query(model.id).distinct()
+                inner_alias = aliased(model)
+                subquery = select(1).select_from(inner_alias)
                 for i, part in enumerate(parts[:-1]):
                     relationship = getattr(current_model, part)
                     related_model = relationship.property.mapper.class_
+
                     if related_model == current_model:
                         # Self-referential relationship
                         alias = aliased(related_model)
                         subquery = subquery.join(alias, relationship)
                         current_model = alias
                     else:
-                        subquery = subquery.join(relationship)
+                        if i == 0:
+                            subquery = subquery.join(relationship)
+                        else:
+                            subquery = subquery.join(relationship)
                         current_model = related_model
                 field = parts[-1]
                 column = getattr(current_model, field)
+
+                # Add correlation condition
+                correlation_condition = model.id == inner_alias.id
             else:
                 column = getattr(model, field)
-                subquery = session.query(model.id)
+                condition = simple_op(op, column, value)
+                return ~condition if is_not else condition
 
-            if op == "=":
-                condition = column == value
-            elif op == "like":
-                condition = column.like(value)
-            elif op == "in":
-                condition = column.in_(value)
-            elif op == ">":
-                condition = column > value
-            elif op == "<":
-                condition = column < value
-            elif op == ">=":
-                condition = column >= value
-            elif op == "<=":
-                condition = column <= value
-            elif op == "!=":
-                condition = column != value
-            else:
-                raise ValueError(f"Unsupported operator: {op}")
+            condition = simple_op(op, column, value)
 
-            subquery = subquery.filter(condition)
+            subquery = subquery.where(and_(condition, correlation_condition))
 
             if is_not:
-                return ~model.id.in_(subquery)
+                return ~exists(subquery)
             else:
-                return model.id.in_(subquery)
+                return exists(subquery)
 
     if isinstance(query_params[0], list):
         # Multiple conditions or advanced query
